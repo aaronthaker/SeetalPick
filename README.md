@@ -8,6 +8,8 @@ A polished, two-person decision app for restaurants, takeaway, things to watch a
 - Touch-first Tinder-style cards with drag, buttons, keyboard controls and undo
 - Same-day completion tracking and private-until-complete matches
 - Persistent shared decks and a guided add flow
+- Genre or mood selection before every deck, plus collapsible per-genre match results
+- Admin-only inventory editing, archive/restore, permanent removal and validated JSON imports
 - Live OpenStreetMap place lookups, free TVmaze title lookups, and optional TMDB film/TV lookup
 - Responsive layouts for iPhone, iPad, Mac and desktop browsers
 - A no-setup local preview mode for trying both sides
@@ -41,14 +43,22 @@ Without Supabase values, the app intentionally starts in preview mode. Use `toge
    where id = '22222222-2222-4222-8222-222222222222';
    ```
 
-4. Copy `.env.example` to `.env.local` and add the project URL and anon key from Supabase Project Settings → API.
+4. Copy `.env.example` to `.env.local` and add the project URL and publishable key from Supabase Project Settings → API. Legacy JWT `anon` keys remain supported.
 5. Restart the app. The profile menu will say “Shared live data”.
 
 The security model is deliberately simple, as requested: passphrases are hashed in PostgreSQL and checked by a small database function, while the low-risk shared pick data is available to the public anon key. Do not store sensitive information in this app.
 
+## Upgrade an existing live database
+
+If Seetal Pick was already deployed before the admin and genre update, run [`supabase/migrations/20260726_admin_genres.sql`](supabase/migrations/20260726_admin_genres.sql) once in Supabase → SQL Editor **before** deploying the new frontend. It preserves existing cards, swipes and completion history, adds genre metadata, and makes the first account (`11111111-1111-4111-8111-111111111111`) the administrator.
+
+After the migration, sign out and sign back in with the first account’s usual passphrase. The profile menu and mobile navigation will show **Admin workspace**. Admin sessions expire after 12 hours, at which point signing in again issues a new one.
+
+The JSON importer accepts an array of up to 500 objects. `categoryId` and `name` are required; `subtitle`, `imageUrl`, `genres`, `tags`, `source`, `sourceId`, and `sourceUrl` are optional. The admin screen includes a complete example and downloadable template, and validates every item before importing.
+
 ## Lookups
 
-Restaurants, takeaways and activities use OpenStreetMap Nominatim. TV search works with TVmaze and needs no key. For stronger film and TV results, create a TMDB API read token and set `NEXT_PUBLIC_TMDB_READ_TOKEN`.
+Restaurants, takeaways and activities use OpenStreetMap Nominatim. Film and TV search uses TMDB when `NEXT_PUBLIC_TMDB_READ_TOKEN` is configured, bringing across official titles, artwork, years, ratings and genres. TVmaze remains the no-key TV fallback.
 
 ## GitHub Pages
 
@@ -58,7 +68,7 @@ In GitHub:
 
 1. Set Pages → Source to **GitHub Actions**.
 2. Add repository variable `NEXT_PUBLIC_SUPABASE_URL`.
-3. Add repository secret `NEXT_PUBLIC_SUPABASE_ANON_KEY`.
+3. Add repository secret `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`. If you currently use the legacy JWT anon key, the existing `NEXT_PUBLIC_SUPABASE_ANON_KEY` secret still works.
 4. Optionally add secret `NEXT_PUBLIC_TMDB_READ_TOKEN`.
 5. Push to `main`, or run the workflow manually.
 
@@ -73,4 +83,3 @@ npm run build:github # static output in /out
 npm test             # build plus rendered-shell check
 npm run lint
 ```
-

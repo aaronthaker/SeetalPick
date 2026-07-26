@@ -1,7 +1,8 @@
 "use client";
 
-import { SEED_ITEMS, stableImage, todayKey } from "./catalog";
+import { GENRE_OPTIONS, inferGenres, stableImage, SEED_ITEMS, todayKey } from "./catalog";
 import type {
+  AdminItemInput,
   AppState,
   AppUser,
   CategoryId,
@@ -12,14 +13,14 @@ import type {
 } from "./types";
 
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL?.replace(/\/$/, "");
-const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 const tmdbToken = process.env.NEXT_PUBLIC_TMDB_READ_TOKEN;
 const storageKey = "seetal-pick-demo-v1";
 const sessionKey = "seetal-pick-session";
 
 const demoUsers: AppUser[] = [
-  { id: "partner-one", displayName: "You", avatarColor: "#ef6a56" },
-  { id: "partner-two", displayName: "Partner", avatarColor: "#168a77" },
+  { id: "partner-one", displayName: "You", avatarColor: "#ef6a56", isAdmin: true, adminToken: "preview-admin" },
+  { id: "partner-two", displayName: "Partner", avatarColor: "#168a77", isAdmin: false },
 ];
 
 const isRemote = Boolean(supabaseUrl && supabaseKey);
@@ -28,6 +29,8 @@ type DbUser = {
   id: string;
   display_name: string;
   avatar_color: string;
+  is_admin?: boolean;
+  admin_token?: string | null;
 };
 
 type DbItem = {
@@ -36,21 +39,24 @@ type DbItem = {
   name: string;
   subtitle: string | null;
   image_url: string | null;
+  genres: string[] | null;
   tags: string[] | null;
   source: string;
   source_id: string | null;
   source_url: string | null;
   added_by: string | null;
   created_at: string;
+  active: boolean;
 };
 
 function headers(extra?: HeadersInit): HeadersInit {
-  return {
+  const base: Record<string, string> = {
     apikey: supabaseKey ?? "",
-    Authorization: `Bearer ${supabaseKey ?? ""}`,
     "Content-Type": "application/json",
-    ...extra,
   };
+  // Legacy anon keys are JWTs; the newer sb_publishable_ keys must not be used as bearer tokens.
+  if (supabaseKey?.startsWith("eyJ")) base.Authorization = `Bearer ${supabaseKey}`;
+  return { ...base, ...extra };
 }
 
 async function supabaseFetch<T>(path: string, init?: RequestInit): Promise<T> {
@@ -85,10 +91,18 @@ function readLocal(): AppState {
     }
     const parsed = JSON.parse(stored) as AppState;
     return {
-      users: parsed.users?.length ? parsed.users : demoUsers,
-      items: parsed.items?.length ? parsed.items : SEED_ITEMS,
+      users: (parsed.users?.length ? parsed.users : demoUsers).map((user, index) => ({
+        ...user,
+        isAdmin: user.isAdmin ?? index === 0,
+        adminToken: user.isAdmin || index === 0 ? (user.adminToken ?? "preview-admin") : undefined,
+      })),
+      items: (parsed.items?.length ? parsed.items : SEED_ITEMS).map((item) => ({
+        ...item,
+        genres: item.genres?.length ? item.genres : inferGenres(item.categoryId, item.tags ?? []),
+        active: item.active ?? true,
+      })),
       swipes: parsed.swipes ?? [],
-      sessions: parsed.sessions ?? [],
+      sessions: (parsed.sessions ?? []).map((session) => ({ ...session, filterKey: session.filterKey ?? "all" })),
     };
   } catch {
     return fallback;
@@ -104,6 +118,8 @@ function toUser(user: DbUser): AppUser {
     id: user.id,
     displayName: user.display_name,
     avatarColor: user.avatar_color,
+    isAdmin: Boolean(user.is_admin),
+    adminToken: user.admin_token ?? undefined,
   };
 }
 
@@ -114,12 +130,14 @@ function toItem(item: DbItem): PickItem {
     name: item.name,
     subtitle: item.subtitle ?? "Added to your shared list",
     imageUrl: item.image_url ?? stableImage(item.category_id, item.name),
+    genres: item.genres?.length ? item.genres : inferGenres(item.category_id, item.tags ?? []),
     tags: item.tags ?? [],
     source: item.source,
     sourceId: item.source_id ?? undefined,
     sourceUrl: item.source_url ?? undefined,
     addedBy: item.added_by ?? undefined,
     createdAt: item.created_at,
+    active: item.active,
   };
 }
 
@@ -177,13 +195,13 @@ export const seetalService = {
     if (!isRemote) return readLocal();
     const day = todayKey();
     const [users, items, swipes, sessions] = await Promise.all([
-      supabaseFetch<DbUser[]>("app_user_profiles?select=id,display_name,avatar_color&active=eq.true&order=created_at.asc"),
+      supabaseFetch<DbUser[]>("app_user_profiles?select=id,display_name,avatar_color,is_admin&active=eq.true&order=created_at.asc"),
       supabaseFetch<DbItem[]>("pick_items?select=*&active=eq.true&order=created_at.desc"),
       supabaseFetch<Array<{ item_id: string; user_id: string; decision: "yes" | "no"; swiped_on: string }>>(
         `swipes?select=item_id,user_id,decision,swiped_on&swiped_on=eq.${day}`,
       ),
-      supabaseFetch<Array<{ category_id: CategoryId; user_id: string; session_date: string; completed_at: string }>>(
-        `category_sessions?select=category_id,user_id,session_date,completed_at&session_date=eq.${day}`,
+      supabaseFetch<Array<{ category_id: CategoryId; filter_key: string; user_id: string; session_date: string; completed_at: string }>>(
+        `category_sessions?select=category_id,filter_key,user_id,session_date,completed_at&session_date=eq.${day}`,
       ),
     ]);
 
@@ -198,6 +216,7 @@ export const seetalService = {
       })),
       sessions: sessions.map((session) => ({
         categoryId: session.category_id,
+        filterKey: session.filter_key,
         userId: session.user_id,
         sessionDate: session.session_date,
         completedAt: session.completed_at,
@@ -255,19 +274,21 @@ export const seetalService = {
         (current) =>
           !(current.userId === session.userId &&
             current.categoryId === session.categoryId &&
-            current.sessionDate === session.sessionDate),
+            current.sessionDate === session.sessionDate &&
+            current.filterKey === session.filterKey),
       );
       state.sessions.push(session);
       writeLocal(state);
       return;
     }
 
-    await supabaseFetch("category_sessions?on_conflict=user_id,category_id,session_date", {
+    await supabaseFetch("category_sessions?on_conflict=user_id,category_id,session_date,filter_key", {
       method: "POST",
       headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
       body: JSON.stringify({
         user_id: session.userId,
         category_id: session.categoryId,
+        filter_key: session.filterKey,
         session_date: session.sessionDate,
         completed_at: session.completedAt,
       }),
@@ -287,6 +308,7 @@ export const seetalService = {
       name: item.name,
       subtitle: item.subtitle,
       image_url: item.imageUrl,
+      genres: item.genres,
       tags: item.tags,
       source: item.source,
       source_id: item.sourceId ?? null,
@@ -299,6 +321,85 @@ export const seetalService = {
       body: JSON.stringify(payload),
     });
     return toItem(created[0]);
+  },
+
+  async loadAdminItems(adminToken: string): Promise<PickItem[]> {
+    if (!isRemote) return readLocal().items;
+    if (!adminToken) throw new Error("Your admin session has expired. Sign in again.");
+    const items = await supabaseFetch<DbItem[]>("pick_items?select=*&order=created_at.desc");
+    return items.map(toItem);
+  },
+
+  async adminUpdateItem(adminToken: string, itemId: string, item: AdminItemInput): Promise<PickItem> {
+    if (!adminToken) throw new Error("Your admin session has expired. Sign in again.");
+    if (!isRemote) {
+      const state = readLocal();
+      const index = state.items.findIndex((candidate) => candidate.id === itemId);
+      if (index < 0) throw new Error("That item no longer exists.");
+      state.items[index] = { ...state.items[index], ...item };
+      writeLocal(state);
+      return state.items[index];
+    }
+    const result = await supabaseFetch<DbItem[] | DbItem>("rpc/admin_update_item", {
+      method: "POST",
+      body: JSON.stringify({ p_admin_token: adminToken, p_item_id: itemId, p_item: item }),
+    });
+    const record = Array.isArray(result) ? result[0] : result;
+    return toItem(record);
+  },
+
+  async adminSetItemActive(adminToken: string, itemId: string, active: boolean): Promise<PickItem> {
+    if (!adminToken) throw new Error("Your admin session has expired. Sign in again.");
+    if (!isRemote) {
+      const state = readLocal();
+      const item = state.items.find((candidate) => candidate.id === itemId);
+      if (!item) throw new Error("That item no longer exists.");
+      item.active = active;
+      writeLocal(state);
+      return item;
+    }
+    const result = await supabaseFetch<DbItem[] | DbItem>("rpc/admin_set_item_active", {
+      method: "POST",
+      body: JSON.stringify({ p_admin_token: adminToken, p_item_id: itemId, p_active: active }),
+    });
+    const record = Array.isArray(result) ? result[0] : result;
+    return toItem(record);
+  },
+
+  async adminDeleteItem(adminToken: string, itemId: string): Promise<void> {
+    if (!adminToken) throw new Error("Your admin session has expired. Sign in again.");
+    if (!isRemote) {
+      const state = readLocal();
+      state.items = state.items.filter((item) => item.id !== itemId);
+      state.swipes = state.swipes.filter((swipe) => swipe.itemId !== itemId);
+      writeLocal(state);
+      return;
+    }
+    await supabaseFetch("rpc/admin_delete_item", {
+      method: "POST",
+      body: JSON.stringify({ p_admin_token: adminToken, p_item_id: itemId }),
+    });
+  },
+
+  async adminImportItems(adminToken: string, items: AdminItemInput[]): Promise<{ imported: number; skipped: number }> {
+    if (!adminToken) throw new Error("Your admin session has expired. Sign in again.");
+    if (!isRemote) {
+      const state = readLocal();
+      let imported = 0;
+      let skipped = 0;
+      for (const input of items) {
+        const duplicate = state.items.some((item) => item.categoryId === input.categoryId && item.name.toLowerCase() === input.name.toLowerCase());
+        if (duplicate) { skipped += 1; continue; }
+        state.items.unshift({ ...input, id: crypto.randomUUID(), active: true, createdAt: new Date().toISOString() });
+        imported += 1;
+      }
+      writeLocal(state);
+      return { imported, skipped };
+    }
+    return supabaseFetch<{ imported: number; skipped: number }>("rpc/admin_import_items", {
+      method: "POST",
+      body: JSON.stringify({ p_admin_token: adminToken, p_items: items }),
+    });
   },
 };
 
@@ -315,6 +416,38 @@ function placeImage(result: {
     return `https://commons.wikimedia.org/wiki/Special:FilePath/${encodeURIComponent(commons.slice(5))}?width=1200`;
   }
   return stableImage(categoryId, seed);
+}
+
+const TMDB_MOVIE_GENRES: Record<number, string> = {
+  28: "Action", 12: "Action", 16: "Animation", 35: "Comedy", 80: "Thriller",
+  99: "Documentary", 18: "Drama", 10751: "Family", 14: "Fantasy", 36: "Drama",
+  27: "Horror", 10402: "Other", 9648: "Mystery", 10749: "Romance",
+  878: "Sci-Fi", 10770: "Drama", 53: "Thriller", 10752: "Action", 37: "Other",
+};
+
+const TMDB_TV_GENRES: Record<number, string> = {
+  10759: "Action", 16: "Animation", 35: "Comedy", 80: "Thriller", 99: "Documentary",
+  18: "Drama", 10751: "Family", 10762: "Family", 9648: "Mystery", 10763: "Documentary",
+  10764: "Other", 10765: "Sci-Fi", 10766: "Drama", 10767: "Other", 10768: "Action", 37: "Other",
+};
+
+function curatedGenres(categoryId: CategoryId, labels: string[]) {
+  const normalized = labels.map((label) => label.toLowerCase());
+  const aliases: Record<string, string> = {
+    "science-fiction": "Sci-Fi", "science fiction": "Sci-Fi", adventure: "Action",
+    crime: "Thriller", history: "Drama", music: "Other", reality: "Other",
+    tapas: "Mediterranean", spanish: "Mediterranean", cafe: "Other",
+    leisure: "Relaxed", attraction: "Day trip", sports: "Active", sport: "Active",
+  };
+  const genres = new Set<string>();
+  for (const option of GENRE_OPTIONS[categoryId]) {
+    if (normalized.some((label) => label.includes(option.toLowerCase()))) genres.add(option);
+  }
+  for (const label of normalized) {
+    const alias = Object.entries(aliases).find(([source]) => label.includes(source))?.[1];
+    if (alias && GENRE_OPTIONS[categoryId].includes(alias)) genres.add(alias);
+  }
+  return genres.size ? [...genres] : ["Other"];
 }
 
 export async function searchLookup(
@@ -344,6 +477,8 @@ export async function searchLookup(
           overview?: string;
           poster_path?: string;
           backdrop_path?: string;
+          genre_ids?: number[];
+          vote_average?: number;
         }>;
       };
       return data.results
@@ -353,13 +488,17 @@ export async function searchLookup(
           const name = item.title ?? item.name ?? cleanQuery;
           const year = (item.release_date ?? item.first_air_date ?? "").slice(0, 4);
           const path = item.backdrop_path ?? item.poster_path;
+          const genreMap = item.media_type === "movie" ? TMDB_MOVIE_GENRES : TMDB_TV_GENRES;
+          const genres = [...new Set((item.genre_ids ?? []).map((id) => genreMap[id]).filter(Boolean))].slice(0, 3);
+          const rating = item.vote_average && item.vote_average > 0 ? `${item.vote_average.toFixed(1)}/10` : "";
           return {
             id: `tmdb-${item.media_type}-${item.id}`,
             categoryId,
             name,
             subtitle: `${item.media_type === "movie" ? "Film" : "TV series"}${year ? ` · ${year}` : ""}${item.overview ? ` · ${item.overview.slice(0, 90)}` : ""}`,
             imageUrl: path ? `https://image.tmdb.org/t/p/w1280${path}` : stableImage(categoryId, name),
-            tags: [item.media_type === "movie" ? "Film" : "Series", year || "Watchlist"],
+            genres: genres.length ? genres : ["Other"],
+            tags: [item.media_type === "movie" ? "Film" : "Series", ...genres.slice(0, 2), rating].filter(Boolean),
             source: "tmdb",
             sourceId: String(item.id),
             sourceUrl: `https://www.themoviedb.org/${item.media_type}/${item.id}`,
@@ -386,6 +525,7 @@ export async function searchLookup(
       name: show.name,
       subtitle: `TV series${show.premiered ? ` · ${show.premiered.slice(0, 4)}` : ""}${show.genres?.length ? ` · ${show.genres.slice(0, 2).join(" / ")}` : ""}${show.summary ? ` · ${stripHtml(show.summary).slice(0, 80)}` : ""}`,
       imageUrl: show.image?.original ?? show.image?.medium ?? stableImage(categoryId, show.name),
+      genres: curatedGenres(categoryId, show.genres ?? []),
       tags: ["Series", ...(show.genres ?? []).slice(0, 2)],
       source: "tvmaze",
       sourceId: String(show.id),
@@ -420,6 +560,7 @@ export async function searchLookup(
     const name = result.name ?? result.display_name.split(",")[0];
     const area = result.address?.suburb ?? result.address?.town ?? result.address?.city ?? result.address?.village;
     const kind = result.extratags?.cuisine ?? result.type ?? result.category ?? CATEGORY_LABELS[categoryId];
+    const genres = curatedGenres(categoryId, [kind, result.type ?? "", result.category ?? ""]);
     return {
       id: `osm-${result.place_id}`,
       categoryId,
@@ -428,6 +569,7 @@ export async function searchLookup(
         .filter(Boolean)
         .join(" · "),
       imageUrl: placeImage(result, categoryId, name),
+      genres,
       tags: [kind.replaceAll("_", " "), area ?? "Local"].filter(Boolean),
       source: "openstreetmap",
       sourceId: `${result.osm_type ?? "place"}-${result.osm_id ?? result.place_id}`,
